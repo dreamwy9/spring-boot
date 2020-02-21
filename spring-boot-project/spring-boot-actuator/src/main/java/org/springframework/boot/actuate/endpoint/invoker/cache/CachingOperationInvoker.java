@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2019 the original author or authors.
+ * Copyright 2012-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,11 +19,13 @@ package org.springframework.boot.actuate.endpoint.invoker.cache;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.boot.actuate.endpoint.InvocationContext;
+import org.springframework.boot.actuate.endpoint.http.ApiVersion;
 import org.springframework.boot.actuate.endpoint.invoke.OperationInvoker;
 import org.springframework.util.Assert;
 import org.springframework.util.ClassUtils;
@@ -46,7 +48,7 @@ public class CachingOperationInvoker implements OperationInvoker {
 
 	private final long timeToLive;
 
-	private volatile CachedResponse cachedResponse;
+	private final Map<ApiVersion, CachedResponse> cachedResponses;
 
 	/**
 	 * Create a new instance with the target {@link OperationInvoker} to use to compute
@@ -58,6 +60,7 @@ public class CachingOperationInvoker implements OperationInvoker {
 		Assert.isTrue(timeToLive > 0, "TimeToLive must be strictly positive");
 		this.invoker = invoker;
 		this.timeToLive = timeToLive;
+		this.cachedResponses = new ConcurrentHashMap<>();
 	}
 
 	/**
@@ -74,11 +77,12 @@ public class CachingOperationInvoker implements OperationInvoker {
 			return this.invoker.invoke(context);
 		}
 		long accessTime = System.currentTimeMillis();
-		CachedResponse cached = this.cachedResponse;
+		ApiVersion contextApiVersion = context.getApiVersion();
+		CachedResponse cached = this.cachedResponses.get(contextApiVersion);
 		if (cached == null || cached.isStale(accessTime, this.timeToLive)) {
 			Object response = this.invoker.invoke(context);
 			cached = createCachedResponse(response, accessTime);
-			this.cachedResponse = cached;
+			this.cachedResponses.put(contextApiVersion, cached);
 		}
 		return cached.getResponse();
 	}
@@ -107,7 +111,9 @@ public class CachingOperationInvoker implements OperationInvoker {
 	 * @param timeToLive the maximum time in milliseconds that a response can be cached
 	 * @return a caching version of the invoker or the original instance if caching is not
 	 * required
+	 * @deprecated as of 2.3.0 to make it package-private in 2.4
 	 */
+	@Deprecated
 	public static OperationInvoker apply(OperationInvoker invoker, long timeToLive) {
 		if (timeToLive > 0) {
 			return new CachingOperationInvoker(invoker, timeToLive);

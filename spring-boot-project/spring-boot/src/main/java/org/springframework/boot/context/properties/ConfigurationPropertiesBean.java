@@ -17,16 +17,17 @@
 package org.springframework.boot.context.properties;
 
 import java.lang.annotation.Annotation;
-import java.lang.reflect.Constructor;
+import java.lang.reflect.AnnotatedElement;
 import java.lang.reflect.Method;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.springframework.aop.support.AopUtils;
-import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.boot.context.properties.bind.Bindable;
@@ -34,22 +35,27 @@ import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
-import org.springframework.core.KotlinDetector;
 import org.springframework.core.ResolvableType;
 import org.springframework.core.annotation.MergedAnnotation;
 import org.springframework.core.annotation.MergedAnnotations;
 import org.springframework.core.annotation.MergedAnnotations.SearchStrategy;
 import org.springframework.util.Assert;
+import org.springframework.util.ClassUtils;
+import org.springframework.util.ReflectionUtils;
 import org.springframework.validation.annotation.Validated;
 
 /**
- * Provides access to {@link ConfigurationProperties} beans from an
- * {@link ApplicationContext}.
+ * Provides access to {@link ConfigurationProperties @ConfigurationProperties} bean
+ * details, regardless of if the annotation was used directly or on a {@link Bean @Bean}
+ * factory method. This class can be used to access {@link #getAll(ApplicationContext)
+ * all} configuration properties beans in an ApplicationContext, or
+ * {@link #get(ApplicationContext, Object, String) individual beans} on a case-by-case
+ * basis (for example, in a {@link BeanPostProcessor}).
  *
  * @author Phillip Webb
  * @since 2.2.0
- * @see #get(ApplicationContext, Object, String)
  * @see #getAll(ApplicationContext)
+ * @see #get(ApplicationContext, Object, String)
  */
 public final class ConfigurationPropertiesBean {
 
@@ -64,12 +70,12 @@ public final class ConfigurationPropertiesBean {
 	private final BindMethod bindMethod;
 
 	private ConfigurationPropertiesBean(String name, Object instance, ConfigurationProperties annotation,
-			Bindable<?> bindTarget, BindMethod bindMethod) {
+			Bindable<?> bindTarget) {
 		this.name = name;
 		this.instance = instance;
 		this.annotation = annotation;
 		this.bindTarget = bindTarget;
-		this.bindMethod = bindMethod;
+		this.bindMethod = BindMethod.forType(bindTarget.getType().resolve());
 	}
 
 	/**
@@ -148,17 +154,33 @@ public final class ConfigurationPropertiesBean {
 		Iterator<String> beanNames = beanFactory.getBeanNamesIterator();
 		while (beanNames.hasNext()) {
 			String beanName = beanNames.next();
-			try {
-				Object bean = beanFactory.getBean(beanName);
-				ConfigurationPropertiesBean propertiesBean = get(applicationContext, bean, beanName);
-				if (propertiesBean != null) {
+			if (isConfigurationPropertiesBean(beanFactory, beanName)) {
+				try {
+					Object bean = beanFactory.getBean(beanName);
+					ConfigurationPropertiesBean propertiesBean = get(applicationContext, bean, beanName);
 					propertiesBeans.put(beanName, propertiesBean);
 				}
-			}
-			catch (NoSuchBeanDefinitionException ex) {
+				catch (Exception ex) {
+				}
 			}
 		}
 		return propertiesBeans;
+	}
+
+	private static boolean isConfigurationPropertiesBean(ConfigurableListableBeanFactory beanFactory, String beanName) {
+		try {
+			if (beanFactory.getBeanDefinition(beanName).isAbstract()) {
+				return false;
+			}
+			if (beanFactory.findAnnotationOnBean(beanName, ConfigurationProperties.class) != null) {
+				return true;
+			}
+			Method factoryMethod = findFactoryMethod(beanFactory, beanName);
+			return findMergedAnnotation(factoryMethod, ConfigurationProperties.class).isPresent();
+		}
+		catch (NoSuchBeanDefinitionException ex) {
+			return false;
+		}
 	}
 
 	/**
@@ -187,14 +209,41 @@ public final class ConfigurationPropertiesBean {
 	}
 
 	private static Method findFactoryMethod(ConfigurableApplicationContext applicationContext, String beanName) {
-		ConfigurableListableBeanFactory beanFactory = applicationContext.getBeanFactory();
+		return findFactoryMethod(applicationContext.getBeanFactory(), beanName);
+	}
+
+	private static Method findFactoryMethod(ConfigurableListableBeanFactory beanFactory, String beanName) {
 		if (beanFactory.containsBeanDefinition(beanName)) {
 			BeanDefinition beanDefinition = beanFactory.getMergedBeanDefinition(beanName);
 			if (beanDefinition instanceof RootBeanDefinition) {
-				return ((RootBeanDefinition) beanDefinition).getResolvedFactoryMethod();
+				Method resolvedFactoryMethod = ((RootBeanDefinition) beanDefinition).getResolvedFactoryMethod();
+				if (resolvedFactoryMethod != null) {
+					return resolvedFactoryMethod;
+				}
 			}
+			return findFactoryMethodUsingReflection(beanFactory, beanDefinition);
 		}
 		return null;
+	}
+
+	private static Method findFactoryMethodUsingReflection(ConfigurableListableBeanFactory beanFactory,
+			BeanDefinition beanDefinition) {
+		String factoryMethodName = beanDefinition.getFactoryMethodName();
+		String factoryBeanName = beanDefinition.getFactoryBeanName();
+		if (factoryMethodName == null || factoryBeanName == null) {
+			return null;
+		}
+		Class<?> factoryType = beanFactory.getType(factoryBeanName);
+		if (factoryType.getName().contains(ClassUtils.CGLIB_CLASS_SEPARATOR)) {
+			factoryType = factoryType.getSuperclass();
+		}
+		AtomicReference<Method> factoryMethod = new AtomicReference<>();
+		ReflectionUtils.doWithMethods(factoryType, (method) -> {
+			if (method.getName().equals(factoryMethodName)) {
+				factoryMethod.set(method);
+			}
+		});
+		return factoryMethod.get();
 	}
 
 	static ConfigurationPropertiesBean forValueObject(Class<?> beanClass, String beanName) {
@@ -212,26 +261,23 @@ public final class ConfigurationPropertiesBean {
 		Validated validated = findAnnotation(instance, type, factory, Validated.class);
 		Annotation[] annotations = (validated != null) ? new Annotation[] { annotation, validated }
 				: new Annotation[] { annotation };
-		Constructor<?> bindConstructor = BindMethod.findBindConstructor(type);
-		BindMethod bindMethod = (bindConstructor != null) ? BindMethod.VALUE_OBJECT : BindMethod.forClass(type);
 		ResolvableType bindType = (factory != null) ? ResolvableType.forMethodReturnType(factory)
 				: ResolvableType.forClass(type);
-		Bindable<Object> bindTarget = Bindable.of(bindType).withAnnotations(annotations)
-				.withConstructorFilter(ConfigurationPropertiesBean::isBindableConstructor);
+		Bindable<Object> bindTarget = Bindable.of(bindType).withAnnotations(annotations);
 		if (instance != null) {
 			bindTarget = bindTarget.withExistingValue(instance);
 		}
-		return new ConfigurationPropertiesBean(name, instance, annotation, bindTarget, bindMethod);
+		return new ConfigurationPropertiesBean(name, instance, annotation, bindTarget);
 	}
 
 	private static <A extends Annotation> A findAnnotation(Object instance, Class<?> type, Method factory,
 			Class<A> annotationType) {
 		MergedAnnotation<A> annotation = MergedAnnotation.missing();
 		if (factory != null) {
-			annotation = MergedAnnotations.from(factory, SearchStrategy.TYPE_HIERARCHY).get(annotationType);
+			annotation = findMergedAnnotation(factory, annotationType);
 		}
 		if (!annotation.isPresent()) {
-			annotation = MergedAnnotations.from(type, SearchStrategy.TYPE_HIERARCHY).get(annotationType);
+			annotation = findMergedAnnotation(type, annotationType);
 		}
 		if (!annotation.isPresent() && AopUtils.isAopProxy(instance)) {
 			annotation = MergedAnnotations.from(AopUtils.getTargetClass(instance), SearchStrategy.TYPE_HIERARCHY)
@@ -240,13 +286,10 @@ public final class ConfigurationPropertiesBean {
 		return annotation.isPresent() ? annotation.synthesize() : null;
 	}
 
-	private static boolean isBindableConstructor(Constructor<?> constructor) {
-		Class<?> declaringClass = constructor.getDeclaringClass();
-		Constructor<?> bindConstructor = BindMethod.findBindConstructor(declaringClass);
-		if (bindConstructor != null) {
-			return bindConstructor.equals(constructor);
-		}
-		return BindMethod.forClass(declaringClass) == BindMethod.VALUE_OBJECT;
+	private static <A extends Annotation> MergedAnnotation<A> findMergedAnnotation(AnnotatedElement element,
+			Class<A> annotationType) {
+		return (element != null) ? MergedAnnotations.from(element, SearchStrategy.TYPE_HIERARCHY).get(annotationType)
+				: MergedAnnotation.missing();
 	}
 
 	/**
@@ -264,40 +307,9 @@ public final class ConfigurationPropertiesBean {
 		 */
 		VALUE_OBJECT;
 
-		static BindMethod forClass(Class<?> type) {
-			if (isConstructorBindingType(type) || findBindConstructor(type) != null) {
-				return VALUE_OBJECT;
-			}
-			return JAVA_BEAN;
-		}
-
-		private static boolean isConstructorBindingType(Class<?> type) {
-			return MergedAnnotations.from(type, SearchStrategy.TYPE_HIERARCHY_AND_ENCLOSING_CLASSES)
-					.isPresent(ConstructorBinding.class);
-		}
-
-		static Constructor<?> findBindConstructor(Class<?> type) {
-			if (KotlinDetector.isKotlinPresent() && KotlinDetector.isKotlinType(type)) {
-				Constructor<?> constructor = BeanUtils.findPrimaryConstructor(type);
-				if (constructor != null) {
-					return findBindConstructor(type, constructor);
-				}
-			}
-			return findBindConstructor(type, type.getDeclaredConstructors());
-		}
-
-		private static Constructor<?> findBindConstructor(Class<?> type, Constructor<?>... candidates) {
-			Constructor<?> constructor = null;
-			for (Constructor<?> candidate : candidates) {
-				if (MergedAnnotations.from(candidate).isPresent(ConstructorBinding.class)) {
-					Assert.state(candidate.getParameterCount() > 0,
-							type.getName() + " declares @ConstructorBinding on a no-args constructor");
-					Assert.state(constructor == null,
-							type.getName() + " has more than one @ConstructorBinding constructor");
-					constructor = candidate;
-				}
-			}
-			return constructor;
+		static BindMethod forType(Class<?> type) {
+			return (ConfigurationPropertiesBindConstructorProvider.INSTANCE.getBindConstructor(type, false) != null)
+					? VALUE_OBJECT : JAVA_BEAN;
 		}
 
 	}

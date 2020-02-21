@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2019 the original author or authors.
+ * Copyright 2012-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,14 +22,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.context.config.ConfigFileApplicationListener;
+import org.springframework.boot.context.event.ApplicationPreparedEvent;
 import org.springframework.boot.env.EnvironmentPostProcessor;
 import org.springframework.boot.json.JsonParser;
 import org.springframework.boot.json.JsonParserFactory;
+import org.springframework.boot.logging.DeferredLog;
+import org.springframework.context.ApplicationListener;
 import org.springframework.core.Ordered;
 import org.springframework.core.env.CommandLinePropertySource;
 import org.springframework.core.env.ConfigurableEnvironment;
@@ -87,11 +87,13 @@ import org.springframework.util.StringUtils;
  *
  * @author Dave Syer
  * @author Andy Wilkinson
+ * @author Madhura Bhave
  * @since 1.3.0
  */
-public class CloudFoundryVcapEnvironmentPostProcessor implements EnvironmentPostProcessor, Ordered {
+public class CloudFoundryVcapEnvironmentPostProcessor
+		implements EnvironmentPostProcessor, Ordered, ApplicationListener<ApplicationPreparedEvent> {
 
-	private static final Log logger = LogFactory.getLog(CloudFoundryVcapEnvironmentPostProcessor.class);
+	private static final DeferredLog logger = new DeferredLog();
 
 	private static final String VCAP_APPLICATION = "VCAP_APPLICATION";
 
@@ -125,6 +127,11 @@ public class CloudFoundryVcapEnvironmentPostProcessor implements EnvironmentPost
 				propertySources.addFirst(new PropertiesPropertySource("vcap", properties));
 			}
 		}
+	}
+
+	@Override
+	public void onApplicationEvent(ApplicationPreparedEvent event) {
+		logger.switchTo(CloudFoundryVcapEnvironmentPostProcessor.class);
 	}
 
 	private void addWithPrefix(Properties properties, Properties other, String prefix) {
@@ -224,7 +231,19 @@ public class CloudFoundryVcapEnvironmentPostProcessor implements EnvironmentPost
 		if (key.startsWith("[")) {
 			return path + key;
 		}
+		if (shouldWrap(key)) {
+			return path + "[" + key + "]";
+		}
 		return path + "." + key;
+	}
+
+	private boolean shouldWrap(String key) {
+		for (char ch : key.toCharArray()) {
+			if (!Character.isLowerCase(ch) && !Character.isDigit(ch) && ch != '-') {
+				return true;
+			}
+		}
+		return false;
 	}
 
 }

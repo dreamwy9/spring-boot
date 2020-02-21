@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2019 the original author or authors.
+ * Copyright 2012-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -232,6 +232,16 @@ public abstract class AbstractWebMvcEndpointHandlerMapping extends RequestMappin
 	}
 
 	@Override
+	protected HandlerMethod getHandlerInternal(HttpServletRequest request) throws Exception {
+		try {
+			return super.getHandlerInternal(request);
+		}
+		finally {
+			ProducesRequestCondition.clearMediaTypesAttribute(request);
+		}
+	}
+
+	@Override
 	protected boolean isHandler(Class<?> beanType) {
 		return false;
 	}
@@ -284,7 +294,7 @@ public abstract class AbstractWebMvcEndpointHandlerMapping extends RequestMappin
 	 * Adapter class to convert an {@link OperationInvoker} into a
 	 * {@link ServletWebOperation}.
 	 */
-	private class ServletWebOperationAdapter implements ServletWebOperation {
+	private static class ServletWebOperationAdapter implements ServletWebOperation {
 
 		private static final String PATH_SEPARATOR = AntPathMatcher.DEFAULT_PATH_SEPARATOR;
 
@@ -375,7 +385,7 @@ public abstract class AbstractWebMvcEndpointHandlerMapping extends RequestMappin
 	/**
 	 * Handler for a {@link ServletWebOperation}.
 	 */
-	private final class OperationHandler {
+	private static final class OperationHandler {
 
 		private final ServletWebOperation operation;
 
